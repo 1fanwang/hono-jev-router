@@ -51,8 +51,10 @@ HTTP Request → JevRouter → Jev: "does the request match this description?" �
 - `app.on('jev', '<description>', handler)` registers a semantic route.
 - The method, URL, headers and body of the request are sent to Jev with one yes/no ([Noul](https://docs.typesafe.ai/primitives/noul)) question per description. They are evaluated in parallel in a single call.
 - Like a normal router, **the first registered route that matches wins**. A route matches when its probability reaches the `threshold`.
+- Duplicate descriptions are rejected when the route is registered, because Jev returns probabilities by description and cannot distinguish identical labels.
 - The handler is a normal Hono handler: `c.req.method` and `c.req.path` are those of the real request.
-- If no description matches, the request falls through, usually to `app.notFound()`.
+- If no description matches, the Jev call fails, or the Jev call times out, the request falls through, usually to `app.notFound()`.
+- Without an `apiKey`, `run` or `choose`, the request fails with a configuration error instead of reaching Jev.
 - Everything else works as usual. Path routes and middleware are handled by Hono's `TrieRouter`, and a path route that returns a response wins before Jev is asked.
 
 ```ts
@@ -91,6 +93,7 @@ new JevRouter({
   apiKey, // string | (c) => string
   baseURL, // default: 'https://api.typesafe.ai'
   threshold, // a route matches when its probability is at least this. default: 0.5
+  timeoutMs, // how long to wait for Jev before falling through. default: 10000
   maxBodyLength, // how much of the request body Jev sees. default: 4096
   redactHeaders, // header values Jev must not see. default: authorization, cookie, ...
   run, // reach Jev some other way

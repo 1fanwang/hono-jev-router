@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
 import { test } from 'node:test'
 import { Hono } from 'hono'
 import { JevRouter, type JevRequest } from '../src/index.ts'
@@ -29,6 +30,28 @@ const createApp = (threshold?: number) => {
   app.on('jev', 'a request from agent', (c) => c.text(`agent ${c.req.method} ${c.req.path}`))
   app.on('jev', 'a request from browser', (c) => c.text(`browser: ${c.get('jev').route}`))
   return app
+}
+
+const withJevServer = async (
+  handler: (req: IncomingMessage, res: ServerResponse) => void,
+  testCase: (baseURL: string) => Promise<void>
+) => {
+  const server = createServer(handler)
+  await new Promise<void>((resolve) => {
+    server.listen(0, '127.0.0.1', resolve)
+  })
+  const address = server.address()
+  if (!address || typeof address === 'string') {
+    throw new Error('Jev test server did not bind to a TCP port')
+  }
+  try {
+    await testCase(`http://127.0.0.1:${address.port}`)
+  } finally {
+    server.closeAllConnections()
+    await new Promise<void>((resolve, reject) => {
+      server.close((err) => (err ? reject(err) : resolve()))
+    })
+  }
 }
 
 test('routes by meaning', async () => {
@@ -64,6 +87,73 @@ test('falls through to notFound when no route reaches the threshold', async () =
   assert.equal(unknown.status, 404)
   const strict = await createApp(0.95).request('/docs', { headers: { 'User-Agent': 'agent' } })
   assert.equal(strict.status, 404)
+})
+
+test('falls through to notFound when the Jev API returns an error', async () => {
+  await withJevServer(
+    (_req, res) => {
+      res.writeHead(500, { 'Content-Type': 'text/plain' })
+      res.end('model unavailable')
+    },
+    async (baseURL) => {
+      const app = new Hono({ router: new JevRouter({ apiKey: 'test', baseURL }) })
+      app.on('jev', 'any GET request', (c) => c.text('matched'))
+
+      const res = await app.request('/')
+
+      assert.equal(res.status, 404)
+    }
+  )
+})
+
+test('falls through to notFound when the Jev API times out', async () => {
+  await withJevServer(
+    () => {},
+    async (baseURL) => {
+      const app = new Hono({ router: new JevRouter({ apiKey: 'test', baseURL, timeoutMs: 50 }) })
+      app.on('jev', 'any GET request', (c) => c.text('matched'))
+
+      const res = await Promise.race<Response | 'hung'>([
+        app.request('/'),
+        new Promise((resolve) => setTimeout(() => resolve('hung'), 250)),
+      ])
+
+      assert.notEqual(res, 'hung', 'request hung instead of timing out the Jev call')
+      assert.equal((res as Response).status, 404)
+    }
+  )
+})
+
+test('reports a missing apiKey instead of calling Jev', async () => {
+  let called = false
+  await withJevServer(
+    (_req, res) => {
+      called = true
+      res.writeHead(401, { 'Content-Type': 'text/plain' })
+      res.end('unauthorized')
+    },
+    async (baseURL) => {
+      const app = new Hono({ router: new JevRouter({ baseURL }) })
+      app.on('jev', 'any GET request', (c) => c.text('matched'))
+      app.onError((err, c) => c.text(err.message, 500))
+
+      const res = await app.request('/')
+
+      assert.equal(res.status, 500)
+      assert.match(await res.text(), /apiKey/)
+      assert.equal(called, false)
+    }
+  )
+})
+
+test('rejects duplicate Jev route descriptions', () => {
+  const app = new Hono({ router: new JevRouter({ run }) })
+  app.on('jev', 'same description', (c) => c.text('first'))
+
+  assert.throws(
+    () => app.on('jev', 'same description', (c) => c.text('second')),
+    /Duplicate Jev route description: same description/
+  )
 })
 
 test('handlers can still read the body, even a binary one', async () => {

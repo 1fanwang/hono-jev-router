@@ -38,6 +38,8 @@ export type JevRouterOptions = {
   choose?: (c: Context, input: JevInput) => Promise<JevResult>
   /** A route matches when its probability is at least this. Default: 0.5 */
   threshold?: number
+  /** How long to wait for a Jev decision before falling through. Default: 10000 */
+  timeoutMs?: number
   /** Default: 4096 */
   maxBodyLength?: number
   /**
@@ -49,6 +51,7 @@ export type JevRouterOptions = {
 
 const METHOD = 'JEV'
 const DEFAULT_THRESHOLD = 0.5
+const DEFAULT_TIMEOUT_MS = 10000
 // Jev only needs to know these exist, not what they hold
 const DEFAULT_REDACT_HEADERS = [
   'authorization',
@@ -72,18 +75,53 @@ export type JevRun = (request: JevRequest) => Promise<JevResponse>
 
 /** Calls the TypeSafe REST API directly */
 export const fetchJev =
-  (options: { apiKey?: string; baseURL?: string }): JevRun =>
+  (options: { apiKey?: string; baseURL?: string; timeoutMs?: number }): JevRun =>
   async (request) => {
-    const res = await fetch(`${options.baseURL ?? 'https://api.typesafe.ai'}/v1/systemone`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${options.apiKey}` },
-      body: JSON.stringify({ model: 'jev-latest', ...request }),
-    })
-    if (!res.ok) {
-      throw new Error(`Jev request failed: ${res.status} ${await res.text()}`)
+    const controller = new AbortController()
+    const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS
+    const timeout =
+      timeoutMs > 0
+        ? setTimeout(() => controller.abort(new Error('Jev request timed out')), timeoutMs)
+        : undefined
+    try {
+      const res = await fetch(`${options.baseURL ?? 'https://api.typesafe.ai'}/v1/systemone`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${options.apiKey}` },
+        body: JSON.stringify({ model: 'jev-latest', ...request }),
+        signal: controller.signal,
+      })
+      if (!res.ok) {
+        throw new Error(`Jev request failed: ${res.status} ${await res.text()}`)
+      }
+      return res.json()
+    } finally {
+      if (timeout) {
+        clearTimeout(timeout)
+      }
     }
-    return res.json()
   }
+
+const withTimeout = async <T>(promise: Promise<T>, timeoutMs: number): Promise<T> => {
+  if (timeoutMs <= 0) {
+    return promise
+  }
+  let timeout: ReturnType<typeof setTimeout> | undefined
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    timeout = setTimeout(() => reject(new Error('Jev request timed out')), timeoutMs)
+  })
+  try {
+    return await Promise.race([promise, timeoutPromise])
+  } finally {
+    if (timeout) {
+      clearTimeout(timeout)
+    }
+  }
+}
+
+const noMatch = (input: JevInput): JevResult => ({
+  confidence: 0,
+  probabilities: Object.fromEntries(input.routes.map((route) => [route, 0])),
+})
 
 /**
  * Ask Jev whether the request matches each description (one Noul question per route, one call).
@@ -150,7 +188,11 @@ export class JevRouter<T> implements Router<T> {
 
   add(method: string, path: string, handler: T) {
     if (method === METHOD) {
-      this.#routes.push({ description: path.replace(/^\//, ''), handler })
+      const description = path.replace(/^\//, '')
+      if (this.#routes.some((route) => route.description === description)) {
+        throw new Error(`Duplicate Jev route description: ${description}`)
+      }
+      this.#routes.push({ description, handler })
       return
     }
     this.#inner.add(method, path, handler)
@@ -166,7 +208,14 @@ export class JevRouter<T> implements Router<T> {
   }
 
   #dispatch = async (c: Context, next: Next) => {
-    const { choose, run, apiKey, baseURL, maxBodyLength = 4096 } = this.#options
+    const {
+      choose,
+      run,
+      apiKey,
+      baseURL,
+      maxBodyLength = 4096,
+      timeoutMs = DEFAULT_TIMEOUT_MS,
+    } = this.#options
     const threshold = this.#options.threshold ?? DEFAULT_THRESHOLD
     const redact = new Set(
       (this.#options.redactHeaders ?? DEFAULT_REDACT_HEADERS).map((name) => name.toLowerCase())
@@ -185,14 +234,26 @@ export class JevRouter<T> implements Router<T> {
       routes: this.#routes.map((r) => r.description),
       threshold,
     }
-    const result = choose
-      ? await choose(c, input)
-      : await chooseWithJev(
-          input,
-          run
-            ? (request) => run(c, request)
-            : fetchJev({ apiKey: typeof apiKey === 'function' ? apiKey(c) : apiKey, baseURL })
-        )
+    let result: JevResult
+    if (choose) {
+      result = await choose(c, input)
+    } else {
+      let jev: JevRun
+      if (run) {
+        jev = (request) => run(c, request)
+      } else {
+        const key = typeof apiKey === 'function' ? apiKey(c) : apiKey
+        if (!key) {
+          throw new Error('JevRouter needs an apiKey, a run function or a choose function')
+        }
+        jev = fetchJev({ apiKey: key, baseURL, timeoutMs })
+      }
+      try {
+        result = await withTimeout(chooseWithJev(input, jev), timeoutMs)
+      } catch {
+        result = noMatch(input)
+      }
+    }
     c.set('jev', result)
     const route = this.#routes.find((r) => r.description === result.route)
     if (!route || result.confidence < threshold) {
